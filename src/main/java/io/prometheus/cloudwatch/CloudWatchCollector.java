@@ -1,5 +1,27 @@
 package io.prometheus.cloudwatch;
 
+import io.prometheus.client.Collector;
+import io.prometheus.client.Counter;
+
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Pattern;
+
+import org.yaml.snakeyaml.Yaml;
+
 import com.amazonaws.auth.STSAssumeRoleSessionCredentialsProvider;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.RegionUtils;
@@ -12,24 +34,6 @@ import com.amazonaws.services.cloudwatch.model.GetMetricStatisticsResult;
 import com.amazonaws.services.cloudwatch.model.ListMetricsRequest;
 import com.amazonaws.services.cloudwatch.model.ListMetricsResult;
 import com.amazonaws.services.cloudwatch.model.Metric;
-import io.prometheus.client.Collector;
-import io.prometheus.client.Counter;
-
-import java.io.FileReader;
-import java.io.Reader;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Date;
-import java.util.List;
-import java.util.Set;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.regex.Pattern;
-
-import org.yaml.snakeyaml.Yaml;
 
 public class CloudWatchCollector extends Collector {
     private static final Logger LOGGER = Logger.getLogger(CloudWatchCollector.class.getName());
@@ -37,13 +41,21 @@ public class CloudWatchCollector extends Collector {
     static class ActiveConfig implements Cloneable {
         ArrayList<MetricRule> rules;
         AmazonCloudWatchClient client;
+        Map<String, ResourceMapping> mappings;
 
         @Override
         public Object clone() throws CloneNotSupportedException {
             return super.clone();
         }
     }
-
+    
+    static class ResourceMapping {
+    	String resourceType;
+    	String resourceIDField;
+    	String lookupURL;
+    	List<String> additionalLabels;
+    }
+    
     static class MetricRule {
       String awsNamespace;
       String awsMetricName;
@@ -131,9 +143,29 @@ public class CloudWatchCollector extends Collector {
         if (!config.containsKey("metrics")) {
           throw new IllegalArgumentException("Must provide metrics");
         }
-
+                
+        Map<String, ResourceMapping> mappings = new HashMap<String, ResourceMapping>();
+        if (config.containsKey("mappings")) {
+           
+            for (Object ruleObject : (List<Map<String,Object>>) config.get("mappings")) {
+              Map<String, Object> yamlResourceMapping = (Map<String, Object>)ruleObject;
+              ResourceMapping mapping = new ResourceMapping();
+              if (!yamlResourceMapping.containsKey("name") || !yamlResourceMapping.containsKey("id_field")|| !yamlResourceMapping.containsKey("lookup_url")) {
+                  throw new IllegalArgumentException("Must provide aws_namespace and aws_metric_name");
+              }
+              mapping.resourceType = (String)yamlResourceMapping.get("name");
+              mapping.resourceIDField = (String)yamlResourceMapping.get("id_field");
+              mapping.lookupURL = (String)yamlResourceMapping.get("lookup_url");
+              if (yamlResourceMapping.containsKey("additional_labels")) {
+                  mapping.additionalLabels = (List<String>)yamlResourceMapping.get("additional_labels");
+              }
+    
+              mappings.put(mapping.resourceType, mapping);
+            }
+        }
+        
         ArrayList<MetricRule> rules = new ArrayList<MetricRule>();
-
+        
         for (Object ruleObject : (List<Map<String,Object>>) config.get("metrics")) {
           Map<String, Object> yamlMetricRule = (Map<String, Object>)ruleObject;
           MetricRule rule = new MetricRule();
@@ -183,13 +215,14 @@ public class CloudWatchCollector extends Collector {
           }
         }
 
-        loadConfig(rules, client);
+        loadConfig(mappings, rules, client);
     }
 
-    private void loadConfig(ArrayList<MetricRule> rules, AmazonCloudWatchClient client) {
+    private void loadConfig(Map<String, ResourceMapping> mappings, ArrayList<MetricRule> rules, AmazonCloudWatchClient client) {
         synchronized (activeConfig) {
             activeConfig.client = client;
             activeConfig.rules = rules;
+            activeConfig.mappings = mappings;
         }
     }
 
@@ -218,6 +251,7 @@ public class CloudWatchCollector extends Collector {
         request.setNextToken(nextToken);
         ListMetricsResult result = client.listMetrics(request);
         cloudwatchRequests.inc();
+        System.out.println(cloudwatchRequests.get());
         for (Metric metric: result.getMetrics()) {
           if (metric.getDimensions().size() != dimensionFilters.size()) {
             // AWS returns all the metrics with dimensions beyond the ones we ask for,
@@ -330,6 +364,7 @@ public class CloudWatchCollector extends Collector {
       ActiveConfig config = (ActiveConfig) activeConfig.clone();
 
       long start = System.currentTimeMillis();
+      int metricQueryCount = 0;
       for (MetricRule rule: config.rules) {
         Date startDate = new Date(start - 1000 * rule.delaySeconds);
         Date endDate = new Date(start - 1000 * (rule.delaySeconds + rule.rangeSeconds));
@@ -361,7 +396,7 @@ public class CloudWatchCollector extends Collector {
 
         for (List<Dimension> dimensions: getDimensions(rule, config.client)) {
           request.setDimensions(dimensions);
-
+          System.out.println("metricQueryCount " + ++metricQueryCount);
           GetMetricStatisticsResult result = config.client.getMetricStatistics(request);
           cloudwatchRequests.inc();
           Datapoint dp = getNewestDatapoint(result.getDatapoints());
@@ -380,7 +415,7 @@ public class CloudWatchCollector extends Collector {
             labelNames.add(safeName(toSnakeCase(d.getName())));
             labelValues.add(d.getValue());
           }
-
+          addLabelsFromAWSTags(config, rule, labelNames, labelValues);
           if (dp.getSum() != null) {
             sumSamples.add(new MetricFamilySamples.Sample(
                 baseName + "_sum", labelNames, labelValues, dp.getSum()));
@@ -435,7 +470,54 @@ public class CloudWatchCollector extends Collector {
       }
     }
 
-    public List<MetricFamilySamples> collect() {
+    private void addLabelsFromAWSTags(ActiveConfig config, MetricRule rule, List<String> labelNames, List<String> labelValues) {
+        // TODO: Currently ignores region
+        // Region region = RegionUtils.getRegion((String) config.get("region"));
+        // need to check with pacman team on using the region in ES queries
+        
+        ResourceMapping mapping = config.mappings.get(rule.awsNamespace);
+        if (mapping != null) {
+            String resourceName = findResourceName(labelNames, labelValues, mapping);
+            Map<String, String> tags = readTagsForResource(mapping.resourceIDField, resourceName, mapping);
+            for (String key:tags.keySet()){
+                
+                labelNames.add(safeName(toSnakeCase(key)));
+                labelValues.add(tags.get(key));
+            }
+        } else {
+            // TODO: Log warning
+            LOGGER.log(Level.WARNING, "Resource Mapping not configured - " + rule.awsNamespace);
+        }
+    }
+
+    private String findResourceName(List<String> labelNames, List<String> labelValues, ResourceMapping mapping) {
+        String resourceName = "";
+        for (int i = 0; i < labelNames.size(); i++) {
+            if (labelNames.get(i).equalsIgnoreCase(safeName(toSnakeCase(mapping.resourceIDField)))) {
+                resourceName = labelValues.get(i);
+            }
+        }
+        return resourceName;
+    }
+
+    private Map<String, String> readTagsForResource(String resourceIDField, String resourceName, ResourceMapping mapping) {
+        String lookupURL = mapping.lookupURL;
+        if (lookupURL == null || resourceName == null || resourceName.isEmpty()) {
+            // TODO: Log error
+            LOGGER.log(Level.WARNING, "Resource Name Label not found in Data from CloudWatch - " + resourceIDField);
+        } else {
+            Map<String, String> tags = CacheProvider.getInstance().getFromCache(resourceIDField, resourceName, lookupURL);
+            if(tags == null) {
+                tags = ESClient.findTagsForResource(resourceIDField, resourceName, lookupURL, mapping.additionalLabels);
+                CacheProvider.getInstance().put(resourceIDField, resourceName, lookupURL, tags);
+            }
+            return tags;
+        }
+                
+        return Collections.emptyMap();
+    }
+	
+	public List<MetricFamilySamples> collect() {
       long start = System.nanoTime();
       double error = 0;
       List<MetricFamilySamples> mfs = new ArrayList<MetricFamilySamples>();
@@ -456,19 +538,32 @@ public class CloudWatchCollector extends Collector {
       mfs.add(new MetricFamilySamples("cloudwatch_exporter_scrape_error", Type.GAUGE, "Non-zero if this scrape failed.", samples));
       return mfs;
     }
-
+	
+	static String readFile(String path) 
+	        throws IOException 
+	      {
+	        byte[] encoded = Files.readAllBytes(Paths.get(path));
+	        return new String(encoded);
+    }
     /**
      * Convenience function to run standalone.
      */
-    public static void main(String[] args) throws Exception {
-      String region = "eu-west-1";
-      if (args.length > 0) {
-        region = args[0];
+	public static void main(String[] args) throws Exception {
+        
+      String region = "us-west-2";
+      if (args.length > 1) {
+        region = args[1];
       }
-      CloudWatchCollector jc = new CloudWatchCollector(("{"
-      + "`region`: `" + region + "`,"
-      + "`metrics`: [{`aws_namespace`: `AWS/ELB`, `aws_metric_name`: `RequestCount`, `aws_dimensions`: [`AvailabilityZone`, `LoadBalancerName`]}] ,"
-      + "}").replace('`', '"'));
+      String yaml = "D:/Dev/ccpWokspace/cloudwatch_exporter/example.yml";
+      if (args.length > 0) {
+          yaml = args[0];
+      }
+      yaml = readFile(yaml);
+      CloudWatchCollector jc = new CloudWatchCollector(yaml);
+//      ("{"
+//      + "`region`: `" + region + "`,"
+//      + "`metrics`: [{`aws_namespace`: `AWS/ELB`, `aws_metric_name`: `RequestCount`, `aws_dimensions`: [`AvailabilityZone`, `LoadBalancerName`]}] ,"
+//      + "}").replace('`', '"'));
       for(MetricFamilySamples mfs : jc.collect()) {
         System.out.println(mfs);
       }
