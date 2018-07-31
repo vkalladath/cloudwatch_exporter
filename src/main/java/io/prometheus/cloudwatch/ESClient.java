@@ -10,6 +10,8 @@ import java.security.cert.X509Certificate;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSession;
@@ -25,7 +27,6 @@ import org.apache.http.conn.ssl.TrustStrategy;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.impl.conn.SingleClientConnManager;
-import org.json.JSONException;
 import org.json.JSONObject;
 
 import com.mashape.unirest.http.JsonNode;
@@ -33,9 +34,12 @@ import com.mashape.unirest.http.Unirest;
 import com.mashape.unirest.http.exceptions.UnirestException;
 
 public class ESClient {
+	
+    private static final Logger LOGGER = Logger.getLogger(ESClient.class.getName());
 
-    private static final String UNTAGGED = "UNKNOWN";
+    private static final String UNTAGGED = "UNTAGGED";
     private static final String TAGS_PREFIX = "tags.";
+    private static final String[] TAG_NAMES = { "tags.Environment", "tags.Stack", "tags.Application", "tags.Role", "tags.WorkLoad", "accountname", "region"};
 
     public static void main(String[] args) throws UnirestException, KeyManagementException, NoSuchAlgorithmException, KeyStoreException {
         String fieldName = "autoscalinggroupname";
@@ -46,30 +50,30 @@ public class ESClient {
     }
 
     public static Map<String, String> findTagsForResource(String fieldName, String fieldValue, String esPath, List<String> additionalLabels) {
-        Map<String, String> tags = new HashMap<String, String>();
+        Map<String, String> tags = defaultEmptyTags(TAG_NAMES, additionalLabels);
         Unirest.setHttpClient(makeClient());
 
         String sb = buildQuery(fieldName.toLowerCase(), fieldValue);
         JsonNode node;
         try {
-            System.out.println("## Connecting to ES " + fieldValue + " " + fieldName);
+        	LOGGER.info("## Connecting to ES " + fieldValue + " " + fieldName);
             node = Unirest.post("https://search.pacman.corporate.t-mobile.com/api/console/proxy?path=" + esPath.toLowerCase() + "/_search&method=POST").header("kbn-xsrf", "1")
                     .body(sb).asJson().getBody();
         } catch (UnirestException e) {
             // TODO Log Error
-            e.printStackTrace();
-
+        	LOGGER.warning("Error connecting to Pacman API: " + e.getMessage());
             return tags;
         }
         int totalResults = node.getObject().getJSONObject("hits").getInt("total");
-        System.out.println("fieldName" + fieldName + " fieldValue" + fieldValue + " esPath" +esPath);
+        LOGGER.fine("fieldName: " + fieldName + " fieldValue: " + fieldValue + " esPath: " +esPath);
         if (totalResults == 1) {
             JSONObject source = node.getObject().getJSONObject("hits").getJSONArray("hits").getJSONObject(0).getJSONObject("_source");
-            String[] tagNames = { "Environment", "Stack", "Application", "Role", "WorkLoad" };
+            // Tag names are case sensitive
+            
             if(additionalLabels != null && additionalLabels.size() > 0) {
                 extractTags(tags, source, additionalLabels.toArray(new String[additionalLabels.size()]));
             }
-            extractTags(tags, source, tagNames);
+            extractTags(tags, source, TAG_NAMES);
         } else if (totalResults == 0) {
             // TODO: warning
         } else {
@@ -78,19 +82,38 @@ public class ESClient {
         return tags;
     }
 
+	private static HashMap<String, String> defaultEmptyTags(String[] tagNames, List<String> additionalLabels) {
+		HashMap<String, String> tags = new HashMap<String, String>();
+		for (String tagName : tagNames) {
+			tags.put(sanitizeTagName(tagName), UNTAGGED);
+		}
+		if(additionalLabels != null && additionalLabels.size() > 0) {
+			for (String tagName : additionalLabels) {
+				tags.put(sanitizeTagName(tagName), UNTAGGED);
+			}
+		}
+		return tags;
+	}
+
     private static void extractTags(Map<String, String> tags, JSONObject source, String[] tagNames) {
         for (String tagName : tagNames) {
-            if(source.has(TAGS_PREFIX + tagName)){
-                String tagValue = source.getString(TAGS_PREFIX + tagName);
-                tags.put(tagName, tagValue);
+            if(source.has(tagName)){
+                String tagValue = source.getString(tagName);
+                tags.put(sanitizeTagName(tagName), tagValue);
             } else {
-                tags.put(tagName, UNTAGGED);
+                tags.put(sanitizeTagName(tagName), UNTAGGED);
             }
         }
     }
 
+    private static String sanitizeTagName(String tagName) {
+        if(tagName.startsWith(TAGS_PREFIX)) {
+            tagName = tagName.substring(TAGS_PREFIX.length());
+        }
+        return tagName.toLowerCase();
+    }
+
     private static String buildQuery(String fieldName, String fieldValue) {
-        // TODO Auto-generated method stub
         return "{\"size\":\"2\",\"query\":{\"bool\":{\"must\":[{\"term\":{\"" + fieldName + ".keyword\":\"" + fieldValue + "\"}},{\"match\":{\"latest\":true}}]}}}";
     }
 

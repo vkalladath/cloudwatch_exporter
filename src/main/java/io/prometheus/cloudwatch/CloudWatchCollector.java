@@ -36,6 +36,13 @@ import com.amazonaws.services.cloudwatch.model.ListMetricsResult;
 import com.amazonaws.services.cloudwatch.model.Metric;
 
 public class CloudWatchCollector extends Collector {
+
+    private static final String METRICS_CACHE = "metrics";
+
+    private static final String DIMENSIONS_CACHE = "dimensions";
+
+    private static final String ES_CACHE = "es";
+
     private static final Logger LOGGER = Logger.getLogger(CloudWatchCollector.class.getName());
 
     static class ActiveConfig implements Cloneable {
@@ -72,6 +79,12 @@ public class CloudWatchCollector extends Collector {
 
     ActiveConfig activeConfig = new ActiveConfig();
 
+    static{
+        CacheProvider.initCache(ES_CACHE, 100000, 6 * 3600);
+        CacheProvider.initCache(DIMENSIONS_CACHE, 500, 4 * 3600);
+        CacheProvider.initCache(METRICS_CACHE, 1000000, 2 * 60); // 2 minutes
+    }
+    
     private static final Counter cloudwatchRequests = Counter.build()
       .name("cloudwatch_requests_total").help("API requests made to CloudWatch").register();
 
@@ -106,6 +119,7 @@ public class CloudWatchCollector extends Collector {
         loadConfig((Map<String, Object>)new Yaml().load(in), client);
     }
     private void loadConfig(Map<String, Object> config, AmazonCloudWatchClient client) {
+
         if(config == null) {  // Yaml config empty, set config to empty map.
             config = new HashMap<String, Object>();
         }
@@ -117,11 +131,11 @@ public class CloudWatchCollector extends Collector {
         if (config.containsKey("period_seconds")) {
           defaultPeriod = ((Number)config.get("period_seconds")).intValue();
         }
-        int defaultRange = 600;
+        int defaultRange = 120;
         if (config.containsKey("range_seconds")) {
           defaultRange = ((Number)config.get("range_seconds")).intValue();
         }
-        int defaultDelay = 600;
+        int defaultDelay = 60;
         if (config.containsKey("delay_seconds")) {
           defaultDelay = ((Number)config.get("delay_seconds")).intValue();
         }
@@ -159,7 +173,6 @@ public class CloudWatchCollector extends Collector {
               if (yamlResourceMapping.containsKey("additional_labels")) {
                   mapping.additionalLabels = (List<String>)yamlResourceMapping.get("additional_labels");
               }
-    
               mappings.put(mapping.resourceType, mapping);
             }
         }
@@ -231,6 +244,11 @@ public class CloudWatchCollector extends Collector {
     }
 
     private List<List<Dimension>> getDimensions(MetricRule rule, AmazonCloudWatchClient client) {
+        
+      Object dimensionsFromCache = CacheProvider.getFromCache(DIMENSIONS_CACHE, generateKey(rule.awsNamespace, rule.awsMetricName));
+      if (dimensionsFromCache != null) {
+          return (List<List<Dimension>>) dimensionsFromCache;
+      }
       List<List<Dimension>> dimensions = new ArrayList<List<Dimension>>();
       if (rule.awsDimensions == null) {
         dimensions.add(new ArrayList<Dimension>());
@@ -251,7 +269,7 @@ public class CloudWatchCollector extends Collector {
         request.setNextToken(nextToken);
         ListMetricsResult result = client.listMetrics(request);
         cloudwatchRequests.inc();
-        System.out.println(cloudwatchRequests.get());
+        LOGGER.log(Level.FINE, cloudwatchRequests.get() + "");
         for (Metric metric: result.getMetrics()) {
           if (metric.getDimensions().size() != dimensionFilters.size()) {
             // AWS returns all the metrics with dimensions beyond the ones we ask for,
@@ -265,6 +283,7 @@ public class CloudWatchCollector extends Collector {
         nextToken = result.getNextToken();
       } while (nextToken != null);
 
+      CacheProvider.put(DIMENSIONS_CACHE, generateKey(rule.awsNamespace, rule.awsMetricName), dimensions);
       return dimensions;
     }
 
@@ -360,12 +379,16 @@ public class CloudWatchCollector extends Collector {
           + " Unit: " + unit;
     }
 
-    private void scrape(List<MetricFamilySamples> mfs) throws CloneNotSupportedException {
+    private void scrape(String requestedMetricNamespace, List<MetricFamilySamples> mfs) throws CloneNotSupportedException {
       ActiveConfig config = (ActiveConfig) activeConfig.clone();
 
       long start = System.currentTimeMillis();
       int metricQueryCount = 0;
       for (MetricRule rule: config.rules) {
+        if(requestedMetricNamespace != null && !requestedMetricNamespace.equalsIgnoreCase(rule.awsNamespace)) {
+            continue;
+        }
+        
         Date startDate = new Date(start - 1000 * rule.delaySeconds);
         Date endDate = new Date(start - 1000 * (rule.delaySeconds + rule.rangeSeconds));
         GetMetricStatisticsRequest request = new GetMetricStatisticsRequest();
@@ -396,13 +419,25 @@ public class CloudWatchCollector extends Collector {
 
         for (List<Dimension> dimensions: getDimensions(rule, config.client)) {
           request.setDimensions(dimensions);
-          System.out.println("metricQueryCount " + ++metricQueryCount);
-          GetMetricStatisticsResult result = config.client.getMetricStatistics(request);
-          cloudwatchRequests.inc();
-          Datapoint dp = getNewestDatapoint(result.getDatapoints());
+          String key = generateKey(rule.awsNamespace, rule.awsMetricName, String.join("#", rule.awsStatistics.toArray(new String[0])));
+          for(Dimension dimension: dimensions){
+              key = key + dimension.getName() + dimension.getValue();
+          }
+          Object fromCache = CacheProvider.getFromCache(METRICS_CACHE, key);
+          Datapoint dp = null;
+          if(fromCache != null) {
+              dp = (Datapoint) fromCache;
+          } else {
+              //System.out.println("metricQueryCount " + ++metricQueryCount);
+              GetMetricStatisticsResult result = config.client.getMetricStatistics(request);
+              cloudwatchRequests.inc();
+              dp = getNewestDatapoint(result.getDatapoints());
+              CacheProvider.put(METRICS_CACHE, key, dp);
+          }
           if (dp == null) {
             continue;
           }
+          
           unit = dp.getUnit();
 
           List<String> labelNames = new ArrayList<String>();
@@ -473,7 +508,6 @@ public class CloudWatchCollector extends Collector {
     private void addLabelsFromAWSTags(ActiveConfig config, MetricRule rule, List<String> labelNames, List<String> labelValues) {
         // TODO: Currently ignores region
         // Region region = RegionUtils.getRegion((String) config.get("region"));
-        // need to check with pacman team on using the region in ES queries
         
         ResourceMapping mapping = config.mappings.get(rule.awsNamespace);
         if (mapping != null) {
@@ -506,10 +540,10 @@ public class CloudWatchCollector extends Collector {
             // TODO: Log error
             LOGGER.log(Level.WARNING, "Resource Name Label not found in Data from CloudWatch - " + resourceIDField);
         } else {
-            Map<String, String> tags = CacheProvider.getInstance().getFromCache(resourceIDField, resourceName, lookupURL);
+            Map<String, String> tags = (Map<String, String>)CacheProvider.getFromCache(ES_CACHE, generateKey(resourceIDField, resourceName, lookupURL));
             if(tags == null) {
                 tags = ESClient.findTagsForResource(resourceIDField, resourceName, lookupURL, mapping.additionalLabels);
-                CacheProvider.getInstance().put(resourceIDField, resourceName, lookupURL, tags);
+                CacheProvider.put(ES_CACHE, generateKey(resourceIDField, resourceName, lookupURL), tags);
             }
             return tags;
         }
@@ -517,12 +551,18 @@ public class CloudWatchCollector extends Collector {
         return Collections.emptyMap();
     }
 	
-	public List<MetricFamilySamples> collect() {
+    private String generateKey(String... fields){
+        return String.join("#", fields);
+    }
+    public List<MetricFamilySamples> collect() {
+        return collect(null);
+    }
+	public List<MetricFamilySamples> collect(String requestedMetricNamespace) {
       long start = System.nanoTime();
       double error = 0;
       List<MetricFamilySamples> mfs = new ArrayList<MetricFamilySamples>();
       try {
-        scrape(mfs);
+        scrape(requestedMetricNamespace, mfs);
       } catch (Exception e) {
         error = 1;
         LOGGER.log(Level.WARNING, "CloudWatch scrape failed", e);
@@ -536,14 +576,48 @@ public class CloudWatchCollector extends Collector {
       samples.add(new MetricFamilySamples.Sample(
           "cloudwatch_exporter_scrape_error", new ArrayList<String>(), new ArrayList<String>(), error));
       mfs.add(new MetricFamilySamples("cloudwatch_exporter_scrape_error", Type.GAUGE, "Non-zero if this scrape failed.", samples));
+      
+      samples = new ArrayList<MetricFamilySamples.Sample>();
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_usage", Arrays.asList("cache_name"), Arrays.asList(DIMENSIONS_CACHE), CacheProvider.getStatistics(DIMENSIONS_CACHE).getLocalHeapSize()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_usage", Arrays.asList("cache_name"), Arrays.asList(METRICS_CACHE), CacheProvider.getStatistics(METRICS_CACHE).getLocalHeapSize()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_usage", Arrays.asList("cache_name"), Arrays.asList(ES_CACHE), CacheProvider.getStatistics(ES_CACHE).getLocalHeapSize()));
+      mfs.add(new MetricFamilySamples("cloudwatch_exporter_cache_usage", Type.GAUGE, "Memory used by cache.", samples));
+      
+      samples = new ArrayList<MetricFamilySamples.Sample>();
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_hitratio", Arrays.asList("cache_name"), Arrays.asList(DIMENSIONS_CACHE), CacheProvider.getStatistics(DIMENSIONS_CACHE).cacheHitRatio()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_hitratio", Arrays.asList("cache_name"), Arrays.asList(METRICS_CACHE), CacheProvider.getStatistics(METRICS_CACHE).cacheHitRatio()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_hitratio", Arrays.asList("cache_name"), Arrays.asList(ES_CACHE), CacheProvider.getStatistics(ES_CACHE).cacheHitRatio()));
+      mfs.add(new MetricFamilySamples("cloudwatch_exporter_cache_hitratio", Type.GAUGE, "Cache Hit Ratio.", samples));
+      
+      samples = new ArrayList<MetricFamilySamples.Sample>();
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_hitcount", Arrays.asList("cache_name"), Arrays.asList(DIMENSIONS_CACHE), CacheProvider.getStatistics(DIMENSIONS_CACHE).cacheHitCount()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_hitcount", Arrays.asList("cache_name"), Arrays.asList(METRICS_CACHE), CacheProvider.getStatistics(METRICS_CACHE).cacheHitCount()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_hitcount", Arrays.asList("cache_name"), Arrays.asList(ES_CACHE), CacheProvider.getStatistics(ES_CACHE).cacheHitCount()));
+      mfs.add(new MetricFamilySamples("cloudwatch_exporter_cache_hitcount", Type.COUNTER, "Cache Hit Count.", samples));
+      
+      samples = new ArrayList<MetricFamilySamples.Sample>();
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_misscount", Arrays.asList("cache_name"), Arrays.asList(DIMENSIONS_CACHE), CacheProvider.getStatistics(DIMENSIONS_CACHE).cacheMissCount()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_misscount", Arrays.asList("cache_name"), Arrays.asList(METRICS_CACHE), CacheProvider.getStatistics(METRICS_CACHE).cacheMissCount()));
+      samples.add(new MetricFamilySamples.Sample(
+          "cloudwatch_exporter_cache_misscount", Arrays.asList("cache_name"), Arrays.asList(ES_CACHE), CacheProvider.getStatistics(ES_CACHE).cacheMissCount()));
+      mfs.add(new MetricFamilySamples("cloudwatch_exporter_cache_misscount", Type.COUNTER, "Cache Miss Count.", samples));
       return mfs;
     }
 	
-	static String readFile(String path) 
-	        throws IOException 
-	      {
-	        byte[] encoded = Files.readAllBytes(Paths.get(path));
-	        return new String(encoded);
+    static String readFile(String path) throws IOException {
+        byte[] encoded = Files.readAllBytes(Paths.get(path));
+        return new String(encoded);
     }
     /**
      * Convenience function to run standalone.
@@ -554,7 +628,7 @@ public class CloudWatchCollector extends Collector {
       if (args.length > 1) {
         region = args[1];
       }
-      String yaml = "D:/Dev/ccpWokspace/cloudwatch_exporter/example.yml";
+      String yaml = "D:/Dev/newWorkspace/cloudwatch_exporter/example.yml";
       if (args.length > 0) {
           yaml = args[0];
       }

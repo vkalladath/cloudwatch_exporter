@@ -1,54 +1,52 @@
 package io.prometheus.cloudwatch;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import net.sf.ehcache.Cache;
 import net.sf.ehcache.CacheManager;
 import net.sf.ehcache.Element;
 import net.sf.ehcache.config.CacheConfiguration;
+import net.sf.ehcache.statistics.StatisticsGateway;
 
 public class CacheProvider {
 
-    private static CacheProvider instance;
-    CacheManager cm;
-    Cache cache;
+    private static CacheManager cm = new CacheManager();
 
-    private CacheProvider() {
-        init();
-    }
-
-    public static CacheProvider getInstance() {
-        if (instance == null) {
-            instance = new CacheProvider();
+    public static Object getFromCache(String cacheName, String key) {
+        Cache cache = cm.getCache(cacheName);
+        if (cache == null) {
+            cache = initCache(cacheName);
         }
-        return instance;
-    }
-
-    public void init() {
-        cm = CacheManager.getInstance();
-        CacheConfiguration cacheConfiguration = new CacheConfiguration().name("esCache").maxEntriesLocalHeap(100000).timeToLiveSeconds(2000);
-        cm.addCache(new Cache(cacheConfiguration));
-
-        cache = cm.getCache("esCache");
-    }
-
-    public Map<String, String> getFromCache(String resourceIDField, String resourceName, String lookupURL) {
-        String key = generateKey(resourceIDField, resourceName, lookupURL);
         Element element = cache.get(key);
-        if(element == null) {
+        if (element == null) {
             return null;
         }
-        return (Map<String, String>) element.getObjectValue();
+        return element.getObjectValue();
     }
 
-    private String generateKey(String resourceIDField, String resourceName, String lookupURL) {
-        String key = resourceIDField + resourceName + lookupURL;
-        return key;
+    public static Cache initCache(String cacheName, int maxEntries, long ttlSeconds) {
+        CacheConfiguration cacheConfiguration = new CacheConfiguration().name(cacheName).maxEntriesLocalHeap(maxEntries).timeToLiveSeconds(ttlSeconds);
+        cm.addCache(new Cache(cacheConfiguration));
+        return cm.getCache(cacheName);
     }
 
-    public void put(String resourceIDField, String resourceName, String lookupURL, Map<String, String> tags) {
-        String key = generateKey(resourceIDField, resourceName, lookupURL);
+    private static Cache initCache(String cacheName) {
+        return initCache(cacheName, 100000, 2000);
+    }
 
-        cache.put(new Element(key, tags));
+    public static void put(String cacheName, String key, Object element) {
+        Cache cache = cm.getCache(cacheName);
+        if (cache == null) {
+            cache = initCache(cacheName);
+        }
+        if (element != null) {
+            cache.put(new Element(key, element));
+        }
+    }
+    
+    public static StatisticsGateway getStatistics(String cacheName){
+        Cache cache = cm.getCache(cacheName);
+        return cache.getStatistics();
     }
 }
