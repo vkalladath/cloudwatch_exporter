@@ -26,6 +26,6 @@ public class DynamicReloadServlet extends HttpServlet {
         collector.reloadConfig();
 
         resp.setContentType("text/plain");
-        resp.getWriter().print("OK");
+        resp.getWriter().print("RELOAD NOT SUPPORTED IN THIS VERSION");
     }
 }

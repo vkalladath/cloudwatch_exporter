@@ -1,19 +1,13 @@
 package io.prometheus.cloudwatch;
 
-import io.prometheus.cloudwatch.servlet.CouldWatchMetricsServlet;
-
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
-import java.text.MessageFormat;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.logging.Logger;
 
 import org.eclipse.jetty.server.Server;
@@ -21,9 +15,9 @@ import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
 
 import com.mashape.unirest.http.HttpResponse;
-import com.mashape.unirest.http.JsonNode;
 import com.mashape.unirest.http.Unirest;
-import com.mashape.unirest.http.exceptions.UnirestException;
+
+import io.prometheus.cloudwatch.servlet.CouldWatchMetricsServlet;
 
 public class WebServer {
 	private static Logger log = Logger.getLogger(WebServer.class.getName());

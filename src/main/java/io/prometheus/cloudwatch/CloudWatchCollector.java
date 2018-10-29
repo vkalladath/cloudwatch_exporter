@@ -59,6 +59,7 @@ public class CloudWatchCollector extends Collector {
     static class ResourceMapping {
     	String resourceType;
     	String resourceIDField;
+    	String esResourceIDField;
     	String lookupURL;
     	List<String> additionalLabels;
     }
@@ -80,8 +81,8 @@ public class CloudWatchCollector extends Collector {
     ActiveConfig activeConfig = new ActiveConfig();
 
     static{
-        CacheProvider.initCache(ES_CACHE, 100000, 6 * 3600);
-        CacheProvider.initCache(DIMENSIONS_CACHE, 500, 4 * 3600);
+        CacheProvider.initCache(ES_CACHE, 100000, 6 * 3600); // 6 hours
+        CacheProvider.initCache(DIMENSIONS_CACHE, 500, 4 * 3600); // 4 hours
         CacheProvider.initCache(METRICS_CACHE, 1000000, 2 * 60); // 2 minutes
     }
     
@@ -172,7 +173,13 @@ public class CloudWatchCollector extends Collector {
               mapping.lookupURL = (String)yamlResourceMapping.get("lookup_url");
               if (yamlResourceMapping.containsKey("additional_labels")) {
                   mapping.additionalLabels = (List<String>)yamlResourceMapping.get("additional_labels");
-              }
+              } 
+			  if (yamlResourceMapping.containsKey("es_id_field")) {
+				  mapping.esResourceIDField = (String) yamlResourceMapping.get("es_id_field");
+			  } else {
+				  mapping.esResourceIDField = mapping.resourceIDField;
+			  }
+
               mappings.put(mapping.resourceType, mapping);
             }
         }
@@ -512,7 +519,7 @@ public class CloudWatchCollector extends Collector {
         ResourceMapping mapping = config.mappings.get(rule.awsNamespace);
         if (mapping != null) {
             String resourceName = findResourceName(labelNames, labelValues, mapping);
-            Map<String, String> tags = readTagsForResource(mapping.resourceIDField, resourceName, mapping);
+            Map<String, String> tags = readTagsForResource(mapping.esResourceIDField, resourceName, mapping);
             for (String key:tags.keySet()){
                 
                 labelNames.add(safeName(toSnakeCase(key)));
@@ -528,7 +535,12 @@ public class CloudWatchCollector extends Collector {
         String resourceName = "";
         for (int i = 0; i < labelNames.size(); i++) {
             if (labelNames.get(i).equalsIgnoreCase(safeName(toSnakeCase(mapping.resourceIDField)))) {
-                resourceName = labelValues.get(i);
+            	resourceName = labelValues.get(i);
+            	// special handling for Network ELB
+            	if (resourceName.startsWith("net/")) {
+            		resourceName = resourceName.substring(4, resourceName.indexOf("/", 4));
+            		labelValues.set(i, resourceName);
+            	}
             }
         }
         return resourceName;
