@@ -20,30 +20,31 @@ import com.mashape.unirest.http.Unirest;
 import io.prometheus.cloudwatch.servlet.CouldWatchMetricsServlet;
 
 public class WebServer {
-	private static Logger log = Logger.getLogger(WebServer.class.getName());
+        private static Logger log = Logger.getLogger(WebServer.class.getName());
 
     private static final String CONFIG_FILE = "CONFIG_FILE";
     private static final String CONSUL_SERVERS = "CONSUL_SERVERS";
+    private static final String RESOURCE_TYPE = "RESOURCE_TYPE";
     public static String REQUEST_TEMPLATE =
-            "{" + 
-            "   \"ID\": \"CloudWatchExporter-{HOST}-{PORT}\"," + 
-            "   \"Name\": \"CloudWatchExporter\"," + 
-            "   \"Tags\": [" + 
-            "       \"CloudWatchExporter\"" + 
-            "   ]," + 
-            "   \"Address\": \"{HOST}\"," + 
-            "   \"Port\": {PORT}," + 
-            "   \"Check\": {" + 
-            "       \"DeregisterCriticalServiceAfter\": \"10m\"," + 
-            "       \"HTTP\": \"http://{HOST}:{PORT}\"," + 
-            "       \"Interval\": \"30s\"," + 
-            "       \"Status\": \"passing\"" + 
-            "   }" + 
+            "{" +
+            "   \"ID\": \"CloudWatchExporter-{HOST}-{PORT}\"," +
+            "   \"Name\": \"CloudWatchExporter\"," +
+            "   \"Tags\": [" +
+            "       \"CloudWatchExporter\"" +
+            "   ]," +
+            "   \"Address\": \"{HOST}\"," +
+            "   \"Port\": {PORT}," +
+            "   \"Check\": {" +
+            "       \"DeregisterCriticalServiceAfter\": \"10m\"," +
+            "       \"HTTP\": \"http://{HOST}:{PORT}\"," +
+            "       \"Interval\": \"30s\"," +
+            "       \"Status\": \"passing\"" +
+            "   }" +
             "}";
     public static String configFilePath;
-
+    public static String resourceType;
     public static void main(String[] args) throws Exception {
-        
+
         String configFile = System.getenv(CONFIG_FILE);
         if(configFile != null && configFile.length() > 2) {
             configFilePath = configFile;
@@ -57,14 +58,23 @@ public class WebServer {
         } else {
             configFilePath = args[1];
         }
-        
+
         // get consul config
         String consulServers = System.getenv(CONSUL_SERVERS);
         if (consulServers != null) {
             registerOnConsul(consulServers);
         }
 
-        
+        // get resource type
+        String resourceTypeValue = System.getenv(RESOURCE_TYPE);
+        if (resourceTypeValue != null) {
+           resourceType = resourceTypeValue;
+        }
+        else {
+          resourceType = "UNTAGGED";
+        }
+
+
         CloudWatchCollector collector = new CloudWatchCollector(getConfigFileReader(configFilePath));
 
         ReloadSignalHandler.start(collector);
@@ -115,4 +125,3 @@ public class WebServer {
         }
     }
 }
-
